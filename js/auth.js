@@ -1,4 +1,4 @@
-/* global supabaseClient */
+/* global supabaseClient, AppCache, AppError */
 
 const loginForm = document.getElementById("login-form");
 const loginError = document.getElementById("login-error");
@@ -8,8 +8,15 @@ const logoutButton = document.getElementById("logout-button");
 const DEFAULT_ROLE = "admin";
 const LANDING_BY_ROLE = {
   admin: "dashboard.html",
-  supervisor: "credit.html",
+  supervisor: "dashboard.html",
 };
+
+/**
+ * Generate cache key for user role
+ */
+function getRoleCacheKey(email) {
+  return `staff_role_${email?.toLowerCase() ?? "unknown"}`;
+}
 
 function extractRole(source) {
   if (!source) return DEFAULT_ROLE;
@@ -39,18 +46,42 @@ function markCurrentNavLink() {
   });
 }
 
+/**
+ * Normalize email for staff/role lookups (staff table stores lowercase).
+ */
+function normalizeEmail(email) {
+  return (email || "").toLowerCase().trim();
+}
+
+/**
+ * Fetch role from staff table with caching
+ * Uses stale-while-revalidate pattern for fast role lookup
+ */
 async function fetchRoleFromStaff(email) {
-  if (!email) return null;
-  const { data, error } = await supabaseClient
-    .from("staff")
-    .select("role")
-    .eq("email", email)
-    .maybeSingle();
-  if (error) {
-    console.error(error);
-    return null;
+  const normalized = normalizeEmail(email);
+  if (!normalized) return null;
+
+  const cacheKey = getRoleCacheKey(email);
+
+  const fetchFn = async () => {
+    const { data, error } = await supabaseClient
+      .from("staff")
+      .select("role")
+      .eq("email", normalized)
+      .maybeSingle();
+    if (error) {
+      AppError.report(error, { context: "fetchRoleFromStaff" });
+      return null;
+    }
+    return data?.role ?? null;
+  };
+
+  // Use caching if available
+  if (typeof AppCache !== "undefined" && AppCache) {
+    return AppCache.getWithSWR(cacheKey, fetchFn, "staff_role");
   }
-  return data?.role ?? null;
+
+  return fetchFn();
 }
 
 async function resolveRoleForSession(session) {
@@ -58,6 +89,15 @@ async function resolveRoleForSession(session) {
   const email = session.user?.email;
   const staffRole = await fetchRoleFromStaff(email);
   return staffRole ?? extractRole(session);
+}
+
+/**
+ * Clear cached role for a user (call after role changes)
+ */
+function invalidateUserRoleCache(email) {
+  if (typeof AppCache !== "undefined" && AppCache && email) {
+    AppCache.remove(getRoleCacheKey(email));
+  }
 }
 
 if (loginForm) {
@@ -78,10 +118,7 @@ if (loginForm) {
     if (loginButton) loginButton.disabled = false;
 
     if (error) {
-      if (loginError) {
-        loginError.textContent = error.message;
-        loginError.classList.remove("hidden");
-      }
+      AppError.handle(error, { target: loginError });
       return;
     }
 
@@ -92,7 +129,21 @@ if (loginForm) {
 
 if (logoutButton) {
   logoutButton.addEventListener("click", async () => {
+    // Get current session before signing out to clear cache
+    const { data: { session } } = await supabaseClient.auth.getSession();
+    const email = session?.user?.email;
+
     await supabaseClient.auth.signOut();
+
+    // Clear user-specific caches on logout
+    if (email) {
+      invalidateUserRoleCache(email);
+    }
+    // Clear API-related caches
+    if (typeof clearApiCaches === "function") {
+      clearApiCaches();
+    }
+
     window.location.href = "index.html";
   });
 }
@@ -102,19 +153,48 @@ document.addEventListener("DOMContentLoaded", () => {
 });
 
 /**
+ * Verifies page access via server-side database function.
+ * This provides defense-in-depth beyond RLS policies.
+ *
+ * @param {string} pageName - The page identifier (e.g., 'settings', 'analysis')
+ * @returns {Promise<{allowed: boolean, role: string}|null>}
+ */
+async function verifyPageAccess(pageName) {
+  try {
+    const { data, error } = await supabaseClient.rpc("check_page_access", {
+      p_page: pageName,
+    });
+    if (error) {
+      AppError.report(error, { context: "verifyPageAccess", pageName });
+      return null;
+    }
+    return data;
+  } catch (err) {
+    AppError.report(err, { context: "verifyPageAccess", pageName });
+    return null;
+  }
+}
+
+/**
  * Redirects to the login page if there is no active Supabase session.
- * Supports optional role-based gating.
+ * Supports optional role-based gating with server-side verification.
+ *
+ * SECURITY NOTE: Client-side checks are for UX only. All data operations
+ * are protected by Row Level Security (RLS) policies in the database.
+ * Users can bypass UI restrictions but cannot bypass RLS.
  *
  * @param {Object} options
  * @param {string[]} [options.allowedRoles]
  * @param {string} [options.redirectTo] - Where to send unauthenticated users.
  * @param {string} [options.onDenied] - Where to send authenticated users without the required role.
+ * @param {string} [options.pageName] - Page identifier for server-side access verification.
  */
 async function requireAuth(options = {}) {
   const {
     allowedRoles = null,
     redirectTo = "index.html",
     onDenied = "credit.html",
+    pageName = null,
   } = options;
 
   const {
@@ -126,7 +206,29 @@ async function requireAuth(options = {}) {
     return null;
   }
 
+  // Resolve role from client (staff table + JWT fallback) first so we can
+  // use it when server check is missing or disagrees
   const role = await resolveRoleForSession(session);
+
+  // Server-side verification (if pageName provided)
+  // Prefer server result; if server denies, still allow when client role is in allowedRoles
+  // (e.g. user in staff as admin but get_user_role() returned null, or RPC not deployed)
+  if (pageName) {
+    const accessCheck = await verifyPageAccess(pageName);
+    if (accessCheck && !accessCheck.allowed) {
+      // Server says denied: only redirect if client also says not allowed
+      if (Array.isArray(allowedRoles) && allowedRoles.length > 0 && !allowedRoles.includes(role)) {
+        console.warn(`Access denied to ${pageName} for role: ${accessCheck.role}`);
+        window.location.href = onDenied;
+        return null;
+      }
+      // Server denied but client says allowed (e.g. admin in staff, server had null role) – allow
+      return { session, role };
+    }
+    if (accessCheck?.role) {
+      return { session, role: accessCheck.role };
+    }
+  }
 
   if (Array.isArray(allowedRoles) && allowedRoles.length > 0) {
     if (!allowedRoles.includes(role)) {
@@ -138,10 +240,30 @@ async function requireAuth(options = {}) {
   return { session, role };
 }
 
+/**
+ * Applies role-based visibility to UI elements.
+ *
+ * SECURITY NOTE: This is for UX only, NOT security enforcement.
+ * Users can bypass this via browser dev tools, but they CANNOT bypass:
+ * - Row Level Security (RLS) policies on database tables
+ * - Server-side functions (upsert_staff, delete_staff, check_page_access)
+ *
+ * All sensitive operations are protected at the database level.
+ *
+ * @param {string} role - The user's role ('admin' or 'supervisor')
+ */
 function applyRoleVisibility(role) {
-  document
-    .querySelectorAll("[data-role='admin-only']")
-    .forEach((el) => role !== "admin" && el.remove());
+  if (role === "admin") {
+    document.body.classList.add("role-admin");
+    document.querySelectorAll("[data-role='admin-only']").forEach((el) => {
+      el.style.display = "";
+    });
+  } else {
+    document.body.classList.remove("role-admin");
+    document
+      .querySelectorAll("[data-role='admin-only']")
+      .forEach((el) => el.remove());
+  }
 
   document
     .querySelectorAll("[data-role='supervisor-only']")
@@ -152,3 +274,5 @@ window.requireAuth = requireAuth;
 window.resolveLandingByRole = resolveLanding;
 window.applyRoleVisibility = applyRoleVisibility;
 window.resolveRoleForSession = resolveRoleForSession;
+window.verifyPageAccess = verifyPageAccess;
+window.invalidateUserRoleCache = invalidateUserRoleCache;
